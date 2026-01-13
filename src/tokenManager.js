@@ -15,7 +15,7 @@ let volatileTokens = [];
 const fetchTrendingTokens = async () => {
     log('Fetching trending tokens from DexScreener...');
     // DexScreener API for new pairs on Base. Adjust the endpoint as needed.
-    const response = await dexScreenerApi.get('pairs/base/new');
+    const response = await dexScreenerApi.get('dex/search?q=base');
     const pairs = response.data.pairs;
 
     // Extract unique tokens from the new pairs

@@ -1,15 +1,16 @@
 const { ethers } = require('ethers');
 const config = require('./config');
 const { log, withErrorHandling } = require('./utils');
+const { loadBalancer } = require('./provider');
+const { wallet } = require('./wallet');
 
 const { FlashbotsBundleProvider } = require('@flashbots/ethers-provider-bundle');
 
-const provider = new ethers.JsonRpcProvider(config.rpcUrl);
-const wallet = new ethers.Wallet(config.auth.privateKey, provider);
 let flashbotsProvider;
 
 // Initialize Flashbots provider
 (async () => {
+    const provider = loadBalancer.getNextProvider();
     flashbotsProvider = await FlashbotsBundleProvider.create(
         provider,
         new ethers.Wallet(config.auth.privateKey), // Flashbots wallet for signing bundles

@@ -2,7 +2,7 @@ const axios = require('axios');
 const config = require('./config');
 const { log, withErrorHandling } = require('./utils');
 const dexAggregators = require('./utils/dexAggregators');
-const { wallet } = require('./bot');
+const { wallet } = require('./wallet');
 
 const odosApi = axios.create({
     baseURL: config.aggregatorUrls.odos,

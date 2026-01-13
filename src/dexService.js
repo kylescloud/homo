@@ -1,7 +1,7 @@
 const { ethers } = require('ethers');
 const config = require('./config');
 const { log, withErrorHandling } = require('./utils');
-const { wallet } = require('./bot');
+const { loadBalancer } = require('./provider');
 
 const UNISWAP_V3_ROUTER = "0x198EF79F1F515F02dFE9e3115eD9fC07183f02fC";
 const UNISWAP_V3_QUOTER = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"; // Universal Quoter
@@ -19,7 +19,7 @@ const UNISWAP_V3_ROUTER_ABI = [
     "function exactInputSingle(tuple(address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountOut)"
 ];
 
-const provider = new ethers.JsonRpcProvider(config.rpcUrl);
+const provider = loadBalancer.getNextProvider();
 
 const uniswapV3Quoter = new ethers.Contract(UNISWAP_V3_QUOTER, UNISWAP_V3_QUOTER_ABI, provider);
 const AERODROME_ROUTER_ABI = [
@@ -33,7 +33,7 @@ const PANCAKESWAP_V3_QUOTER_ABI = [
 const PANCAKESWAP_V3_ROUTER_ABI = [
     "function exactInputSingle(tuple(address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountOut)"
 ];
-const pancakeSwapV3Router = new ethers.Contract(PANCAKESWAP_V3_ROUTER, PANCAKESWAP_V3_ROUTER_ABI, wallet);
+const pancakeSwapV3Router = new ethers.Contract(PANCAKESWAP_V3_ROUTER, PANCAKESWAP_V3_ROUTER_ABI, provider);
 
 async function getPancakeSwapSwapData(tokenIn, tokenOut, amountIn, amountOutMinimum, fee) {
     const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes from the current Unix time
@@ -121,7 +121,7 @@ async function getAerodromeQuote(tokenIn, tokenOut, amountIn) {
     return null;
 }
 
-const uniswapV3Router = new ethers.Contract(UNISWAP_V3_ROUTER, UNISWAP_V3_ROUTER_ABI, wallet);
+const uniswapV3Router = new ethers.Contract(UNISWAP_V3_ROUTER, UNISWAP_V3_ROUTER_ABI, provider);
 
 async function getUniswapQuote(tokenIn, tokenOut, amountIn) {
     const fees = [500, 3000, 10000]; // Most popular fee tiers
