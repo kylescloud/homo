@@ -114,6 +114,9 @@ contract BaseAlphaArb is FlashLoanSimpleReceiverBase, Ownable, Pausable, Reentra
         uint256 profit = balanceAfter - repayAmount;
         emit ArbExecuted(asset, amount, profit, true);
 
+        // Approve the pool to pull back the funds
+        IERC20(asset).approve(address(POOL), repayAmount);
+
         return true;
     }
 

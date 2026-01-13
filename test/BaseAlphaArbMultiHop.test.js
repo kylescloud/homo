@@ -1,74 +1,67 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
-const { AaveV3Base } = require('@bgd-labs/aave-address-book');
-const { impersonateAccount, stopImpersonatingAccount, loadFixture } = require("@nomicfoundation/hardhat-network-helpers");
+const { loadFixture } = require("@nomicfoundation/hardhat-network-helpers");
 
 describe("BaseAlphaArb Multi-Hop", function () {
     async function deployFixture() {
         const [owner] = await ethers.getSigners();
 
-        const usdcAddress = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-        const wethAddress = "0x4200000000000000000000000000000000000006";
-        const usdc = await ethers.getContractAt("IERC20", usdcAddress);
-        const weth = await ethers.getContractAt("IWETH", wethAddress);
+        // Deploy Mock Tokens
+        const MockERC20 = await ethers.getContractFactory("MockERC20");
+        const usdc = await MockERC20.deploy("USD Coin", "USDC", 6);
+        const dai = await MockERC20.deploy("Dai", "DAI", 18);
+        const weth = await MockERC20.deploy("Wrapped Ether", "WETH", 18);
 
-        await impersonateAccount(AaveV3Base.POOL);
-        const aavePool = await ethers.getSigner(AaveV3Base.POOL);
+        // Deploy Mock Aave Pool and Provider
+        const MockAavePool = await ethers.getContractFactory("MockAavePool");
+        const aavePool = await MockAavePool.deploy();
+        const MockPoolAddressesProvider = await ethers.getContractFactory("MockPoolAddressesProvider");
+        const aaveProvider = await MockPoolAddressesProvider.deploy(aavePool.target);
+        await aavePool.setAddressesProvider(aaveProvider.target);
 
+        // Deploy our BaseAlphaArb contract
         const BaseAlphaArb = await ethers.getContractFactory("BaseAlphaArb");
-        const baseAlphaArb = await BaseAlphaArb.deploy(AaveV3Base.POOL_ADDRESSES_PROVIDER);
-        await baseAlphaArb.waitForDeployment();
+        const baseAlphaArb = await BaseAlphaArb.deploy(aaveProvider.target);
 
+        // Deploy Mock Aggregators
         const MockAggregator = await ethers.getContractFactory("MockAggregator");
         const aggregator1 = await MockAggregator.deploy();
         const aggregator2 = await MockAggregator.deploy();
-        await Promise.all([aggregator1.waitForDeployment(), aggregator2.waitForDeployment()]);
+        const aggregator3 = await MockAggregator.deploy();
 
-        return { baseAlphaArb, owner, usdc, weth, aavePool, aggregator1, aggregator2 };
+        return { baseAlphaArb, owner, usdc, dai, weth, aavePool, aggregator1, aggregator2, aggregator3 };
     }
 
-    it("Should execute a multi-hop flash loan and repay with profit", async function () {
-        const { baseAlphaArb, owner, usdc, weth, aavePool, aggregator1, aggregator2 } = await loadFixture(deployFixture);
+    it("Should execute a three-hop flash loan and repay with profit", async function () {
+        const { baseAlphaArb, owner, usdc, dai, weth, aavePool, aggregator1, aggregator2, aggregator3 } = await loadFixture(deployFixture);
 
-        const loanAmount = ethers.parseUnits("10000", 6); // 10,000 USDC
-        const profit = ethers.parseUnits("100", 6); // 100 USDC profit
+        const loanAmount = ethers.parseUnits("10000", 6);
+        const profit = ethers.parseUnits("100", 6);
+        const amount2 = ethers.parseUnits("10000", 18);
+        const amount3 = ethers.parseUnits("5", 18);
 
-        // Fund the mock aggregators to simulate a profitable trade
-        const usdcWhaleAddress = "0x47ac0Fb4F2D84898e4D9E7b4DaB3C24507a6D503";
-        await impersonateAccount(usdcWhaleAddress);
-        const usdcWhale = await ethers.getSigner(usdcWhaleAddress);
-        await usdc.connect(usdcWhale).transfer(await aggregator2.getAddress(), loanAmount + profit);
-        await stopImpersonatingAccount(usdcWhaleAddress);
+        // Fund the mock aggregators and mock Aave pool
+        let premium = (loanAmount * 9n) / 10000n;
+        await dai.mint(aggregator1.target, amount2);
+        await weth.mint(aggregator2.target, amount3);
+        await usdc.mint(aggregator3.target, loanAmount + profit + premium);
+        await usdc.mint(aavePool.target, loanAmount + premium);
 
-        // Path: USDC -> WETH (via Odos) -> USDC (via Uniswap)
-        const tokens = [usdc.target, weth.target, usdc.target];
-        const intermediateAmount = ethers.parseUnits("5", 18); // 5 WETH
+        // Path: USDC -> DAI -> WETH -> USDC
+        const tokens = [usdc.target, dai.target, weth.target, usdc.target];
 
-        // For the purpose of this test, we'll use the mock aggregators to represent Odos and Uniswap
-        const odosRouter = aggregator1;
-        const uniswapRouter = aggregator2;
-
-        const hop1Data = odosRouter.interface.encodeFunctionData("swap", [usdc.target, weth.target, loanAmount, intermediateAmount]);
-        const hop2Data = uniswapRouter.interface.encodeFunctionData("swap", [weth.target, usdc.target, intermediateAmount, loanAmount + profit]);
+        const hop1Data = aggregator1.interface.encodeFunctionData("swap", [usdc.target, dai.target, loanAmount, amount2]);
+        const hop2Data = aggregator2.interface.encodeFunctionData("swap", [dai.target, weth.target, amount2, amount3]);
+        const hop3Data = aggregator3.interface.encodeFunctionData("swap", [weth.target, usdc.target, amount3, loanAmount + profit + premium]);
 
         const hops = [
-            { target: odosRouter.target, data: hop1Data },
-            { target: uniswapRouter.target, data: hop2Data },
+            { target: aggregator1.target, data: hop1Data },
+            { target: aggregator2.target, data: hop2Data },
+            { target: aggregator3.target, data: hop3Data },
         ];
 
-        // Fund Odos router with WETH to perform the first swap
-        await owner.sendTransaction({ to: weth.target, value: ethers.parseEther("10") }); // Get some WETH
-        await weth.connect(owner).transfer(odosRouter.target, intermediateAmount);
-
-        // The Aave Pool (impersonated) will initiate the flash loan
-        const flashLoanTx = await baseAlphaArb.connect(aavePool).executeOperation(
-            usdc.target,
-            loanAmount,
-            (loanAmount * 9n) / 10000n,
-            baseAlphaArb.target,
-            ethers.AbiCoder.defaultAbiCoder().encode(['address[]', 'tuple(address,bytes)[]'], [tokens, hops])
-        );
-        await flashLoanTx.wait();
+        // Execute the arbitrage
+        await baseAlphaArb.executeArb(tokens, hops, loanAmount);
 
         const finalContractBalance = await usdc.balanceOf(baseAlphaArb.target);
         expect(finalContractBalance).to.equal(profit);
