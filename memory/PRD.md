@@ -68,8 +68,8 @@ Fix the arbitrage bot using AAVE V3 flash loans with DeFi arbitrage strategies t
 - [ ] Live test with small flash loan amounts
 
 ### P1 - Production Hardening
+- [x] Implement Flashblocks (200ms preconfirmations on Base) - DONE
 - [ ] Add WebSocket bot <-> dashboard communication
-- [ ] Implement Flashblocks (200ms blocks on Base)
 - [ ] Add multi-asset flash loan support
 - [ ] Dynamic gas pricing based on Base L1 data costs
 - [ ] Telegram/Discord alerts for profitable trades
