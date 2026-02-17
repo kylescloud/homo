@@ -10,6 +10,7 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./interfaces/ISwapRouter02.sol";
 import "./interfaces/IAerodromeRouter.sol";
+import "./interfaces/IUniswapV2Router02.sol";
 import "./interfaces/IWETH.sol";
 
 /**
@@ -28,10 +29,11 @@ contract BaseAlphaArb is FlashLoanSimpleReceiverBase, Ownable, Pausable, Reentra
     //                         CONSTANTS
     // ============================================================
 
-    uint8 public constant DEX_GENERIC       = 0; // Raw calldata (aggregators like Odos)
+    uint8 public constant DEX_GENERIC        = 0; // Raw calldata (Odos, SushiSwap RouteProcessor)
     uint8 public constant DEX_UNISWAP_V3    = 1; // Uniswap V3 exactInputSingle
     uint8 public constant DEX_AERODROME     = 2; // Aerodrome volatile/stable swap
     uint8 public constant DEX_PANCAKESWAP_V3 = 3; // PancakeSwap V3 exactInputSingle
+    uint8 public constant DEX_UNISWAP_V2    = 4; // Uniswap V2 / BaseSwap (standard V2 AMM)
 
     // ============================================================
     //                          STRUCTS
@@ -240,6 +242,8 @@ contract BaseAlphaArb is FlashLoanSimpleReceiverBase, Ownable, Pausable, Reentra
             _swapAerodrome(step, amountIn);
         } else if (step.dexType == DEX_PANCAKESWAP_V3) {
             _swapPancakeSwapV3(step, amountIn);
+        } else if (step.dexType == DEX_UNISWAP_V2) {
+            _swapUniswapV2(step, amountIn);
         } else if (step.dexType == DEX_GENERIC) {
             _swapGeneric(step);
         } else {
