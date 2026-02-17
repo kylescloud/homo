@@ -214,6 +214,56 @@ describe("BaseAlphaArb", function () {
     });
 
     // ================================================================
+    //  TEST: Two-hop arb using UNISWAP_V2 / BaseSwap typed swap
+    // ================================================================
+    it("Should execute a 2-hop arb via Uniswap V2 / BaseSwap typed interface", async function () {
+        const { baseAlphaArb, owner, usdc, weth, aavePool, mockV2Router } = await loadFixture(deployFixture);
+
+        const loanAmount = ethers.parseUnits("10000", 6);
+        const profit = ethers.parseUnits("60", 6);
+        const intermediateAmount = ethers.parseUnits("5", 18);
+        const premium = (loanAmount * 9n) / 10000n;
+
+        await usdc.mint(aavePool.target, loanAmount + premium);
+        await weth.mint(mockV2Router.target, intermediateAmount);
+        await usdc.mint(mockV2Router.target, loanAmount + profit + premium);
+
+        await mockV2Router.setPresetAmount(usdc.target, weth.target, intermediateAmount);
+        await mockV2Router.setPresetAmount(weth.target, usdc.target, loanAmount + profit + premium);
+
+        const steps = [
+            {
+                dexType: DEX_UNISWAP_V2,
+                router: mockV2Router.target,
+                tokenIn: usdc.target,
+                tokenOut: weth.target,
+                fee: 0,
+                stable: false,
+                factory: ethers.ZeroAddress,
+                amountOutMin: intermediateAmount,
+                data: "0x",
+            },
+            {
+                dexType: DEX_UNISWAP_V2,
+                router: mockV2Router.target,
+                tokenIn: weth.target,
+                tokenOut: usdc.target,
+                fee: 0,
+                stable: false,
+                factory: ethers.ZeroAddress,
+                amountOutMin: loanAmount + profit,
+                data: "0x",
+            }
+        ];
+
+        await baseAlphaArb.executeArb(usdc.target, loanAmount, steps);
+
+        const finalBalance = await usdc.balanceOf(baseAlphaArb.target);
+        expect(finalBalance).to.equal(profit);
+    });
+
+
+    // ================================================================
     //  TEST: Slippage protection reverts when output is insufficient
     // ================================================================
     it("Should revert when per-hop slippage exceeds amountOutMin", async function () {
