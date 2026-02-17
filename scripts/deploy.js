@@ -1,67 +1,43 @@
-const { ethers } = require("hardhat");
-const fs = require("fs");
-const path = require("path");
-const { AaveV3Base, AaveV3BaseSepolia } = require('@bgd-labs/aave-address-book');
+const hre = require("hardhat");
 
 async function main() {
-  const [deployer] = await ethers.getSigners();
-  console.log("Deploying contracts with the account:", deployer.address);
+    const [deployer] = await hre.ethers.getSigners();
+    console.log("Deploying BaseAlphaArb with account:", deployer.address);
 
-  // Determine the network
-  const network = await ethers.provider.getNetwork();
-  const isMainnet = network.name === "base";
-  const isSepolia = network.name === "base-sepolia" || network.name === "sepolia" || network.name === "unknown";
+    // Base Mainnet addresses
+    const AAVE_POOL_ADDRESSES_PROVIDER = "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D";
+    const WETH = "0x4200000000000000000000000000000000000006";
 
-  let poolAddressesProvider;
-  let networkName;
+    // Deploy the contract
+    const BaseAlphaArb = await hre.ethers.getContractFactory("BaseAlphaArb");
+    const baseAlphaArb = await BaseAlphaArb.deploy(AAVE_POOL_ADDRESSES_PROVIDER, WETH);
+    await baseAlphaArb.waitForDeployment();
 
-  if (isMainnet) {
-    poolAddressesProvider = AaveV3Base.POOL_ADDRESSES_PROVIDER;
-    networkName = "base";
-    console.log("Using Aave V3 Base mainnet addresses.");
-  } else if (isSepolia) {
-    poolAddressesProvider = AaveV3BaseSepolia.POOL_ADDRESSES_PROVIDER;
-    networkName = "baseSepolia";
-    console.log("Using Aave V3 Base Sepolia addresses.");
-  } else {
-    throw new Error(`Unsupported network: ${network.name}`);
-  }
+    const contractAddress = await baseAlphaArb.getAddress();
+    console.log("BaseAlphaArb deployed to:", contractAddress);
 
-  if (!poolAddressesProvider) {
-      throw new Error("Could not find POOL_ADDRESSES_PROVIDER for the current network.");
-  }
+    // Whitelist DEX routers on Base
+    const routers = [
+        "0x2626664c2603336E57B271c5C0b26F421741e481", // Uniswap V3 SwapRouter02
+        "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43", // Aerodrome Router
+        "0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86", // PancakeSwap V3 SmartRouter
+        "0x19cEeAd7105607Cd444F5ad10dd51356436095a1", // Odos Router V2
+    ];
 
-  console.log(`PoolAddressesProvider for ${networkName}:`, poolAddressesProvider);
+    console.log("Whitelisting DEX routers...");
+    const tx = await baseAlphaArb.setRouterWhitelistBatch(routers, true);
+    await tx.wait();
+    console.log("Routers whitelisted:", routers);
 
-  // Deploy the contract
-  const BaseAlphaArb = await ethers.getContractFactory("BaseAlphaArb");
-  const baseAlphaArb = await BaseAlphaArb.deploy(poolAddressesProvider);
-  await baseAlphaArb.waitForDeployment();
-
-  const deployedAddress = await baseAlphaArb.getAddress();
-  console.log("BaseAlphaArb deployed to:", deployedAddress);
-
-  // Load or create config to save the new contract address
-  const configPath = path.join(__dirname, "../config/config.json");
-  let config = {};
-  if (fs.existsSync(configPath)) {
-      config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  }
-
-  if (!config.contractAddress) {
-      config.contractAddress = {};
-  }
-
-  // Save the contract address to the config file
-  config.contractAddress[networkName] = deployedAddress;
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-
-  console.log(`Contract address for ${networkName} saved to config.json`);
+    console.log("\n=== Deployment Complete ===");
+    console.log("Contract:", contractAddress);
+    console.log("Owner:", deployer.address);
+    console.log("WETH:", WETH);
+    console.log("\nUpdate config/config.json with:");
+    console.log(`  "contractAddress": { "base": "${contractAddress}" }`);
 }
 
-main()
-  .then(() => process.exit(0))
-  .catch((error) => {
+main().catch((error) => {
     console.error(error);
     process.exit(1);
-  });
+});
