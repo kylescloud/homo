@@ -8,6 +8,7 @@ describe("BaseAlphaArb", function () {
     const DEX_UNISWAP_V3 = 1;
     const DEX_AERODROME = 2;
     const DEX_PANCAKESWAP_V3 = 3;
+    const DEX_UNISWAP_V2 = 4;
 
     async function deployFixture() {
         const [owner, otherAccount] = await ethers.getSigners();
