@@ -40,16 +40,19 @@ describe("BaseAlphaArb", function () {
         const MockAerodromeRouter = await ethers.getContractFactory("MockAerodromeRouter");
         const mockAeroRouter = await MockAerodromeRouter.deploy();
 
+        const MockUniswapV2Router = await ethers.getContractFactory("MockUniswapV2Router");
+        const mockV2Router = await MockUniswapV2Router.deploy();
+
         // Whitelist all routers
         await baseAlphaArb.setRouterWhitelistBatch(
-            [mockAggregator.target, mockUniRouter.target, mockAeroRouter.target],
+            [mockAggregator.target, mockUniRouter.target, mockAeroRouter.target, mockV2Router.target],
             true
         );
 
         return {
             baseAlphaArb, owner, otherAccount,
             usdc, weth, dai,
-            aavePool, mockAggregator, mockUniRouter, mockAeroRouter
+            aavePool, mockAggregator, mockUniRouter, mockAeroRouter, mockV2Router
         };
     }
 
