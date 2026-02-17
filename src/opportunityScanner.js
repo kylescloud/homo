@@ -6,8 +6,19 @@ const dexService = require('./dexService');
 const { calculateNetProfit, isProfitable, simulateTransaction, estimateGasCost } = require('./profitCalculator');
 const provider = require('./provider');
 
+// DEX type constants matching the smart contract
+const DEX_GENERIC = 0;
+const DEX_UNISWAP_V3 = 1;
+const DEX_AERODROME = 2;
+const DEX_PANCAKESWAP_V3 = 3;
+
+const AERODROME_ROUTER = config.dexAddresses?.aerodrome?.router || '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43';
+const AERODROME_FACTORY = config.dexAddresses?.aerodrome?.defaultFactory || '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
+const UNISWAP_V3_ROUTER = config.dexAddresses?.uniswapV3?.swapRouter02 || '0x2626664c2603336E57B271c5C0b26F421741e481';
+
 /**
  * Gets the best quote for a single hop from all available DEXs and aggregators.
+ * Returns both the quote and the metadata needed to build a typed SwapStep.
  */
 async function getBestHopQuote(fromToken, toToken, amountIn, preferredDex) {
     const quotes = [];
@@ -30,36 +41,68 @@ async function getBestHopQuote(fromToken, toToken, amountIn, preferredDex) {
     const validQuotes = quotes.filter(q => q && q.toTokenAmount && BigInt(q.toTokenAmount) > 0n);
     if (validQuotes.length === 0) return null;
 
-    // Return the quote with the highest output amount
     return validQuotes.reduce((best, current) =>
         BigInt(current.toTokenAmount) > BigInt(best.toTokenAmount) ? current : best
     );
 }
 
 /**
- * Builds swap calldata for a specific quote.
+ * Builds a typed SwapStep struct for the smart contract based on the quote source.
+ * Returns the step object matching the contract's SwapStep struct.
  */
-async function buildSwapData(quote, fromToken, toToken, amountIn) {
-    if (quote.aggregator === 'odos') {
-        // For Odos, get assembled transaction
-        const assembled = await aggregatorService.getOdosAssemble(quote);
-        return assembled; // Returns { to, data }
-    }
-
-    // Calculate minimum output with slippage
+async function buildSwapStep(quote, fromToken, toToken, amountIn) {
     const slippageFactor = BigInt(Math.round((1 - (config.slippageBuffer || 0.003)) * 10000));
     const amountOutMin = (BigInt(quote.toTokenAmount) * slippageFactor) / 10000n;
 
     if (quote.dex === 'uniswap') {
-        return await dexService.getUniswapSwapData(fromToken, toToken, amountIn, amountOutMin, quote.fee);
+        // Typed Uniswap V3 swap - contract calls exactInputSingle natively
+        return {
+            dexType: DEX_UNISWAP_V3,
+            router: UNISWAP_V3_ROUTER,
+            tokenIn: fromToken,
+            tokenOut: toToken,
+            fee: quote.fee || 3000,
+            stable: false,
+            factory: ethers.ZeroAddress,
+            amountOutMin: amountOutMin.toString(),
+            data: '0x', // Not needed for typed swaps
+        };
     }
 
     if (quote.dex === 'aerodrome') {
-        return await dexService.getAerodromeSwapData(fromToken, toToken, amountIn, amountOutMin, quote.stable);
+        // Typed Aerodrome swap - contract calls swapExactTokensForTokens with Route struct
+        return {
+            dexType: DEX_AERODROME,
+            router: AERODROME_ROUTER,
+            tokenIn: fromToken,
+            tokenOut: toToken,
+            fee: 0,
+            stable: quote.stable || false,
+            factory: AERODROME_FACTORY,
+            amountOutMin: amountOutMin.toString(),
+            data: '0x',
+        };
     }
 
-    if (quote.dex === 'pancakeswap') {
-        return await dexService.getPancakeSwapSwapData(fromToken, toToken, amountIn, amountOutMin, quote.fee);
+    if (quote.aggregator === 'odos') {
+        // Generic swap via Odos aggregator - contract calls router.call(data)
+        const assembled = await aggregatorService.getOdosAssemble(quote);
+        if (!assembled || !assembled.to || !assembled.data) {
+            log('Failed to assemble Odos swap data');
+            return null;
+        }
+
+        return {
+            dexType: DEX_GENERIC,
+            router: assembled.to,
+            tokenIn: fromToken,
+            tokenOut: toToken,
+            fee: 0,
+            stable: false,
+            factory: ethers.ZeroAddress,
+            amountOutMin: amountOutMin.toString(),
+            data: assembled.data,
+        };
     }
 
     return null;
@@ -67,6 +110,7 @@ async function buildSwapData(quote, fromToken, toToken, amountIn) {
 
 /**
  * Evaluates a multi-hop arbitrage path for profitability.
+ * Builds typed SwapStep[] for the contract to execute atomically.
  */
 async function evaluatePath(pathHops, initialAmount, tokenDatabase) {
     const pathSymbols = pathHops.map(hop =>
@@ -76,21 +120,17 @@ async function evaluatePath(pathHops, initialAmount, tokenDatabase) {
     log(`Scanning: ${pathSymbols}`);
 
     let currentAmount = BigInt(initialAmount);
-    const executedHops = [];
+    const swapSteps = [];
     const tokens = [pathHops[0].from];
 
     for (const hop of pathHops) {
         const quote = await getBestHopQuote(hop.from, hop.to, currentAmount.toString(), hop.dex);
-        if (!quote) {
-            return null; // No viable quote for this hop
-        }
+        if (!quote) return null;
 
-        const swapData = await buildSwapData(quote, hop.from, hop.to, currentAmount);
-        if (!swapData || !swapData.to || !swapData.data) {
-            return null; // Failed to build swap calldata
-        }
+        const step = await buildSwapStep(quote, hop.from, hop.to, currentAmount);
+        if (!step) return null;
 
-        executedHops.push({ target: swapData.to, data: swapData.data });
+        swapSteps.push(step);
         tokens.push(hop.to);
         currentAmount = BigInt(quote.toTokenAmount);
     }
@@ -98,8 +138,7 @@ async function evaluatePath(pathHops, initialAmount, tokenDatabase) {
     const finalAmount = currentAmount;
     const borrowedAmount = BigInt(initialAmount);
 
-    // Calculate net profit (accounting for flash loan premium and gas)
-    const gasCostEstimate = ethers.parseUnits('0.0005', 'ether'); // Conservative gas estimate for Base
+    const gasCostEstimate = ethers.parseUnits('0.0005', 'ether');
     const { netProfit, profitPercent } = calculateNetProfit(finalAmount, borrowedAmount, gasCostEstimate);
 
     const startSymbol = tokenDatabase[tokens[0]]?.symbol || tokens[0].slice(0, 8);
@@ -110,10 +149,14 @@ async function evaluatePath(pathHops, initialAmount, tokenDatabase) {
         const contractAddr = config.contractAddress[config.network];
         if (contractAddr) {
             const ABI = [
-                'function executeArb(address[] calldata tokens, tuple(address target, bytes data)[] calldata hops, uint256 amount)'
+                'function executeArb(address asset, uint256 amount, tuple(uint8 dexType, address router, address tokenIn, address tokenOut, uint24 fee, bool stable, address factory, uint256 amountOutMin, bytes data)[] steps)'
             ];
             const iface = new ethers.Interface(ABI);
-            const calldata = iface.encodeFunctionData('executeArb', [tokens, executedHops, initialAmount]);
+            const calldata = iface.encodeFunctionData('executeArb', [
+                tokens[0], // asset (borrow token)
+                initialAmount,
+                swapSteps
+            ]);
 
             const simSuccess = await simulateTransaction(contractAddr, calldata);
             if (!simSuccess) {
@@ -127,8 +170,8 @@ async function evaluatePath(pathHops, initialAmount, tokenDatabase) {
             profitPercent,
             initialAmount: initialAmount.toString(),
             finalAmount: finalAmount.toString(),
-            tokens,
-            hops: executedHops,
+            asset: tokens[0],
+            swapSteps,
             pathDescription: pathSymbols,
         };
     }
@@ -147,7 +190,6 @@ async function scanAllPaths(paths, tokenDatabase) {
         const scanAmountStr = config.scanAmount || '1';
         const initialAmount = ethers.parseUnits(scanAmountStr, 'ether').toString();
 
-        // Process paths in batches to avoid overwhelming RPC
         const batchSize = 5;
         for (let i = 0; i < paths.length; i += batchSize) {
             const batch = paths.slice(i, i + batchSize);
@@ -176,4 +218,8 @@ async function scanAllPaths(paths, tokenDatabase) {
 module.exports = {
     scanAllPaths: withErrorHandling(scanAllPaths),
     getBestHopQuote: withErrorHandling(getBestHopQuote),
+    DEX_GENERIC,
+    DEX_UNISWAP_V3,
+    DEX_AERODROME,
+    DEX_PANCAKESWAP_V3,
 };
