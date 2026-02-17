@@ -272,6 +272,17 @@ describe("BaseAlphaArb", function () {
                 factory: ethers.ZeroAddress,
                 amountOutMin: 0,
                 data: "0x1234",
+            },
+            {
+                dexType: DEX_GENERIC,
+                router: fakeRouter,
+                tokenIn: weth.target,
+                tokenOut: usdc.target,
+                fee: 0,
+                stable: false,
+                factory: ethers.ZeroAddress,
+                amountOutMin: 0,
+                data: "0x1234",
             }
         ];
 
