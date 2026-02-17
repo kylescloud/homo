@@ -3,44 +3,52 @@ const config = require('./config');
 const { log, withErrorHandling } = require('./utils');
 const aggregatorService = require('./aggregatorService');
 const dexService = require('./dexService');
-const { calculateNetProfit, isProfitable, simulateTransaction, estimateGasCost } = require('./profitCalculator');
+const { calculateNetProfit, isProfitable, simulateTransaction } = require('./profitCalculator');
 const provider = require('./provider');
 
-// DEX type constants matching the smart contract
-const DEX_GENERIC = 0;
-const DEX_UNISWAP_V3 = 1;
-const DEX_AERODROME = 2;
-const DEX_PANCAKESWAP_V3 = 3;
-
-const AERODROME_ROUTER = config.dexAddresses?.aerodrome?.router || '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43';
-const AERODROME_FACTORY = config.dexAddresses?.aerodrome?.defaultFactory || '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
-const UNISWAP_V3_ROUTER = config.dexAddresses?.uniswapV3?.swapRouter02 || '0x2626664c2603336E57B271c5C0b26F421741e481';
+// DEX type constants matching smart contract
+const {
+    DEX_GENERIC, DEX_UNISWAP_V3, DEX_AERODROME, DEX_PANCAKESWAP_V3, DEX_UNISWAP_V2,
+    UNISWAP_V2_ROUTER, UNISWAP_V3_SWAP_ROUTER_02, AERODROME_ROUTER,
+    AERODROME_DEFAULT_FACTORY, PANCAKESWAP_V3_SMART_ROUTER, BASESWAP_ROUTER,
+} = dexService;
 
 /**
- * Gets the best quote for a single hop from all available DEXs and aggregators.
- * Returns both the quote and the metadata needed to build a typed SwapStep.
+ * Gets the best quote for a single hop by querying ALL configured DEXes.
+ * Queries: Uniswap V2, Uniswap V3, Aerodrome, PancakeSwap V3, BaseSwap, Odos
  */
 async function getBestHopQuote(fromToken, toToken, amountIn, preferredDex) {
-    const quotes = [];
+    const quotePromises = [];
 
-    // Always try direct DEX quotes for speed
-    if (!preferredDex || preferredDex === 'uniswap') {
-        const uniQuote = await dexService.getUniswapQuote(fromToken, toToken, amountIn);
-        if (uniQuote) quotes.push(uniQuote);
+    // Direct DEX quotes (fast, on-chain)
+    if (!preferredDex || preferredDex === 'uniswapV2' || preferredDex === 'uniswap') {
+        quotePromises.push(dexService.getUniswapV2Quote(fromToken, toToken, amountIn));
     }
-
+    if (!preferredDex || preferredDex === 'uniswapV3' || preferredDex === 'uniswap') {
+        quotePromises.push(dexService.getUniswapV3Quote(fromToken, toToken, amountIn));
+    }
     if (!preferredDex || preferredDex === 'aerodrome') {
-        const aeroQuote = await dexService.getAerodromeQuote(fromToken, toToken, amountIn);
-        if (aeroQuote) quotes.push(aeroQuote);
+        quotePromises.push(dexService.getAerodromeQuote(fromToken, toToken, amountIn));
+    }
+    if (!preferredDex || preferredDex === 'pancakeswap' || preferredDex === 'pancakeswapV3') {
+        quotePromises.push(dexService.getPancakeSwapV3Quote(fromToken, toToken, amountIn));
+    }
+    if (!preferredDex || preferredDex === 'baseswap') {
+        quotePromises.push(dexService.getBaseSwapQuote(fromToken, toToken, amountIn));
     }
 
-    // Always try Odos aggregator (covers all Base DEXes)
-    const odosQuote = await aggregatorService.getOdosQuote(fromToken, toToken, amountIn);
-    if (odosQuote) quotes.push(odosQuote);
+    // Odos aggregator (covers SushiSwap V3 + all other Base DEXes)
+    quotePromises.push(aggregatorService.getOdosQuote(fromToken, toToken, amountIn));
 
-    const validQuotes = quotes.filter(q => q && q.toTokenAmount && BigInt(q.toTokenAmount) > 0n);
+    const results = await Promise.allSettled(quotePromises);
+    const validQuotes = results
+        .filter(r => r.status === 'fulfilled' && r.value && r.value.toTokenAmount)
+        .map(r => r.value)
+        .filter(q => BigInt(q.toTokenAmount) > 0n);
+
     if (validQuotes.length === 0) return null;
 
+    // Return the quote with the highest output
     return validQuotes.reduce((best, current) =>
         BigInt(current.toTokenAmount) > BigInt(best.toTokenAmount) ? current : best
     );
@@ -48,29 +56,44 @@ async function getBestHopQuote(fromToken, toToken, amountIn, preferredDex) {
 
 /**
  * Builds a typed SwapStep struct for the smart contract based on the quote source.
- * Returns the step object matching the contract's SwapStep struct.
+ * Each DEX gets its proper typed execution path in the contract.
  */
 async function buildSwapStep(quote, fromToken, toToken, amountIn) {
     const slippageFactor = BigInt(Math.round((1 - (config.slippageBuffer || 0.003)) * 10000));
     const amountOutMin = (BigInt(quote.toTokenAmount) * slippageFactor) / 10000n;
 
-    if (quote.dex === 'uniswap') {
-        // Typed Uniswap V3 swap - contract calls exactInputSingle natively
+    // Uniswap V2 / BaseSwap (standard V2 AMM - contract calls swapExactTokensForTokens with path[])
+    if (quote.dexType === DEX_UNISWAP_V2) {
+        return {
+            dexType: DEX_UNISWAP_V2,
+            router: quote.router, // Either UNISWAP_V2_ROUTER or BASESWAP_ROUTER
+            tokenIn: fromToken,
+            tokenOut: toToken,
+            fee: 0,
+            stable: false,
+            factory: ethers.ZeroAddress,
+            amountOutMin: amountOutMin.toString(),
+            data: '0x',
+        };
+    }
+
+    // Uniswap V3 (contract calls exactInputSingle natively)
+    if (quote.dexType === DEX_UNISWAP_V3) {
         return {
             dexType: DEX_UNISWAP_V3,
-            router: UNISWAP_V3_ROUTER,
+            router: UNISWAP_V3_SWAP_ROUTER_02,
             tokenIn: fromToken,
             tokenOut: toToken,
             fee: quote.fee || 3000,
             stable: false,
             factory: ethers.ZeroAddress,
             amountOutMin: amountOutMin.toString(),
-            data: '0x', // Not needed for typed swaps
+            data: '0x',
         };
     }
 
-    if (quote.dex === 'aerodrome') {
-        // Typed Aerodrome swap - contract calls swapExactTokensForTokens with Route struct
+    // Aerodrome (contract calls swapExactTokensForTokens with Route struct)
+    if (quote.dexType === DEX_AERODROME) {
         return {
             dexType: DEX_AERODROME,
             router: AERODROME_ROUTER,
@@ -78,20 +101,34 @@ async function buildSwapStep(quote, fromToken, toToken, amountIn) {
             tokenOut: toToken,
             fee: 0,
             stable: quote.stable || false,
-            factory: AERODROME_FACTORY,
+            factory: AERODROME_DEFAULT_FACTORY,
             amountOutMin: amountOutMin.toString(),
             data: '0x',
         };
     }
 
+    // PancakeSwap V3 (contract calls exactInputSingle - same as UniV3 interface)
+    if (quote.dexType === DEX_PANCAKESWAP_V3) {
+        return {
+            dexType: DEX_PANCAKESWAP_V3,
+            router: PANCAKESWAP_V3_SMART_ROUTER,
+            tokenIn: fromToken,
+            tokenOut: toToken,
+            fee: quote.fee || 2500,
+            stable: false,
+            factory: ethers.ZeroAddress,
+            amountOutMin: amountOutMin.toString(),
+            data: '0x',
+        };
+    }
+
+    // Odos aggregator or SushiSwap RouteProcessor (generic calldata)
     if (quote.aggregator === 'odos') {
-        // Generic swap via Odos aggregator - contract calls router.call(data)
         const assembled = await aggregatorService.getOdosAssemble(quote);
         if (!assembled || !assembled.to || !assembled.data) {
             log('Failed to assemble Odos swap data');
             return null;
         }
-
         return {
             dexType: DEX_GENERIC,
             router: assembled.to,
@@ -109,8 +146,7 @@ async function buildSwapStep(quote, fromToken, toToken, amountIn) {
 }
 
 /**
- * Evaluates a multi-hop arbitrage path for profitability.
- * Builds typed SwapStep[] for the contract to execute atomically.
+ * Evaluates a multi-hop arbitrage path for profitability across all DEXes.
  */
 async function evaluatePath(pathHops, initialAmount, tokenDatabase) {
     const pathSymbols = pathHops.map(hop =>
@@ -121,7 +157,7 @@ async function evaluatePath(pathHops, initialAmount, tokenDatabase) {
 
     let currentAmount = BigInt(initialAmount);
     const swapSteps = [];
-    const tokens = [pathHops[0].from];
+    const dexNames = [];
 
     for (const hop of pathHops) {
         const quote = await getBestHopQuote(hop.from, hop.to, currentAmount.toString(), hop.dex);
@@ -131,21 +167,19 @@ async function evaluatePath(pathHops, initialAmount, tokenDatabase) {
         if (!step) return null;
 
         swapSteps.push(step);
-        tokens.push(hop.to);
+        dexNames.push(quote.dex || quote.aggregator || 'unknown');
         currentAmount = BigInt(quote.toTokenAmount);
     }
 
     const finalAmount = currentAmount;
     const borrowedAmount = BigInt(initialAmount);
-
     const gasCostEstimate = ethers.parseUnits('0.0005', 'ether');
     const { netProfit, profitPercent } = calculateNetProfit(finalAmount, borrowedAmount, gasCostEstimate);
 
-    const startSymbol = tokenDatabase[tokens[0]]?.symbol || tokens[0].slice(0, 8);
-    log(`Result: ${ethers.formatUnits(netProfit, 18)} ${startSymbol} (${profitPercent.toFixed(2)}%)`);
+    const startSymbol = tokenDatabase[pathHops[0].from]?.symbol || pathHops[0].from.slice(0, 8);
+    log(`Result: ${ethers.formatUnits(netProfit, 18)} ${startSymbol} (${profitPercent.toFixed(2)}%) via ${dexNames.join(' -> ')}`);
 
-    if (await isProfitable(netProfit, `${tokens[0]}/${tokens[tokens.length - 1]}`)) {
-        // Simulate before committing
+    if (await isProfitable(netProfit, `${pathHops[0].from}/${pathHops[pathHops.length - 1].to}`)) {
         const contractAddr = config.contractAddress[config.network];
         if (contractAddr) {
             const ABI = [
@@ -153,7 +187,7 @@ async function evaluatePath(pathHops, initialAmount, tokenDatabase) {
             ];
             const iface = new ethers.Interface(ABI);
             const calldata = iface.encodeFunctionData('executeArb', [
-                tokens[0], // asset (borrow token)
+                pathHops[0].from,
                 initialAmount,
                 swapSteps
             ]);
@@ -170,9 +204,10 @@ async function evaluatePath(pathHops, initialAmount, tokenDatabase) {
             profitPercent,
             initialAmount: initialAmount.toString(),
             finalAmount: finalAmount.toString(),
-            asset: tokens[0],
+            asset: pathHops[0].from,
             swapSteps,
             pathDescription: pathSymbols,
+            dexRoute: dexNames.join(' -> '),
         };
     }
 
@@ -180,10 +215,10 @@ async function evaluatePath(pathHops, initialAmount, tokenDatabase) {
 }
 
 /**
- * Scans all cached arbitrage paths for profitable opportunities.
+ * Scans all arbitrage paths across all configured DEXes.
  */
 async function scanAllPaths(paths, tokenDatabase) {
-    log(`Scanning ${paths.length} paths for arbitrage...`);
+    log(`Scanning ${paths.length} paths across UniV2, UniV3, Aerodrome, PancakeSwap, BaseSwap, SushiSwap, Odos...`);
     const opportunities = [];
 
     try {
@@ -203,7 +238,7 @@ async function scanAllPaths(paths, tokenDatabase) {
             for (const result of results) {
                 if (result.status === 'fulfilled' && result.value) {
                     opportunities.push(result.value);
-                    log(`PROFITABLE: ${result.value.pathDescription} | ${ethers.formatUnits(result.value.netProfit, 18)} ETH`);
+                    log(`PROFITABLE: ${result.value.pathDescription} | ${result.value.dexRoute} | ${ethers.formatUnits(result.value.netProfit, 18)} ETH`);
                 }
             }
         }
@@ -222,4 +257,5 @@ module.exports = {
     DEX_UNISWAP_V3,
     DEX_AERODROME,
     DEX_PANCAKESWAP_V3,
+    DEX_UNISWAP_V2,
 };
