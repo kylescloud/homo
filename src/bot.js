@@ -8,13 +8,14 @@ const { getFlashLoanableAssets } = require('./aaveService');
 const { fetchAllPairs } = require('./dexScreenerService');
 const { generateAndCachePaths } = require('./pathGenerator');
 const { scanAllPaths, DEX_GENERIC, DEX_UNISWAP_V3, DEX_AERODROME, DEX_PANCAKESWAP_V3 } = require('./opportunityScanner');
-const { sendPrivateTransaction } = require('./mevProtection');
+const { sendAndConfirm } = require('./mevProtection');
+const provider = require('./provider');
+const { initFlashblocks, onFlashblock, getEffectiveScanInterval, isFlashblocksEnabled } = require('./provider');
 
-const SCAN_INTERVAL = config.scanIntervalMs || 4000;
 let scanCount = 0;
 let isRunning = false;
 
-// New contract ABI with typed SwapStep struct
+// Contract ABI with typed SwapStep struct
 const CONTRACT_ABI = [
     'function executeArb(address asset, uint256 amount, tuple(uint8 dexType, address router, address tokenIn, address tokenOut, uint24 fee, bool stable, address factory, uint256 amountOutMin, bytes data)[] steps)',
     'function setRouterWhitelist(address router, bool status)',
@@ -53,14 +54,13 @@ async function handleOpportunity(opportunity) {
     try {
         const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, wallet);
 
-        // Build the transaction
         const tx = await contract.executeArb.populateTransaction(
             asset,
             initialAmount,
             swapSteps
         );
 
-        // Estimate gas with safety buffer
+        // Estimate gas
         try {
             const gasEstimate = await wallet.provider.estimateGas({
                 ...tx,
@@ -69,93 +69,127 @@ async function handleOpportunity(opportunity) {
             tx.gasLimit = (gasEstimate * 130n) / 100n;
         } catch (gasError) {
             log(`Gas estimation failed: ${gasError.message}. Using safe default.`);
-            tx.gasLimit = 800000n; // Higher default for multi-hop
+            tx.gasLimit = 800000n;
         }
 
         log(`Sending ${swapSteps.length}-hop arb transaction...`);
-        const txResponse = await sendPrivateTransaction(tx);
 
-        if (txResponse) {
-            log(`TX Hash: ${txResponse.hash}`);
-            log('Waiting for confirmation...');
+        // Use Flashblocks-aware send + confirm (200ms preconfirmation)
+        const receipt = await sendAndConfirm(tx);
 
-            const receipt = await txResponse.wait(1);
-            if (receipt && receipt.status === 1) {
-                log(`CONFIRMED in block ${receipt.blockNumber}!`);
-                log(`Gas used: ${receipt.gasUsed.toString()}`);
+        if (receipt) {
+            log(`TX Hash: ${receipt.txHash || receipt.hash}`);
+            log(`Gas used: ${receipt.gasUsed?.toString() || 'unknown'}`);
 
-                // Parse events for detailed execution info
-                const iface = new ethers.Interface(CONTRACT_ABI);
-                for (const eventLog of receipt.logs) {
-                    try {
-                        const parsed = iface.parseLog(eventLog);
-                        if (parsed.name === 'SwapExecuted') {
-                            log(`  Step ${parsed.args.stepIndex}: ${parsed.args.tokenIn.slice(0, 10)}... -> ${parsed.args.tokenOut.slice(0, 10)}... | In: ${parsed.args.amountIn} Out: ${parsed.args.amountOut}`);
-                        }
-                        if (parsed.name === 'ArbExecuted') {
-                            log(`  Profit: ${ethers.formatUnits(parsed.args.profit, 18)} ETH`);
-                        }
-                    } catch (e) { /* not our event */ }
-                }
-
-                return {
-                    success: true,
-                    txHash: txResponse.hash,
-                    blockNumber: receipt.blockNumber,
-                    gasUsed: receipt.gasUsed.toString(),
-                };
-            } else {
-                log('Transaction REVERTED on-chain.');
-                return { success: false, txHash: txResponse.hash, reason: 'reverted' };
+            // Parse events
+            const iface = new ethers.Interface(CONTRACT_ABI);
+            for (const eventLog of (receipt.logs || [])) {
+                try {
+                    const parsed = iface.parseLog(eventLog);
+                    if (parsed.name === 'SwapExecuted') {
+                        log(`  Step ${parsed.args.stepIndex}: In: ${parsed.args.amountIn} Out: ${parsed.args.amountOut}`);
+                    }
+                    if (parsed.name === 'ArbExecuted') {
+                        log(`  Profit: ${ethers.formatUnits(parsed.args.profit, 18)} ETH`);
+                    }
+                } catch (e) { /* not our event */ }
             }
+
+            return { success: true, txHash: receipt.txHash || receipt.hash, blockNumber: receipt.blockNumber, gasUsed: receipt.gasUsed?.toString() };
+        } else {
+            return { success: false, reason: 'confirmation failed' };
         }
     } catch (error) {
         log(`Execution error: ${error.message}`);
         return { success: false, reason: error.message };
     }
-
-    return null;
 }
 
 /**
- * The main scanning loop.
+ * Main scanning loop with Flashblocks support.
+ * With Flashblocks: scans every ~200ms on each sub-block
+ * Without Flashblocks: scans at configured interval (default 4s)
  */
 async function startScanning(paths, tokenDatabase) {
-    log(`Starting scanner with ${paths.length} paths...`);
+    const scanInterval = getEffectiveScanInterval();
+    const mode = isFlashblocksEnabled() ? 'FLASHBLOCKS (200ms)' : `STANDARD (${scanInterval}ms)`;
+    log(`Starting scanner | Mode: ${mode} | Paths: ${paths.length}`);
     isRunning = true;
 
-    while (isRunning) {
-        scanCount++;
-        log(`--- Scan #${scanCount} ---`);
+    if (isFlashblocksEnabled()) {
+        // Event-driven scanning on each flashblock (200ms sub-blocks)
+        log('[FLASHBLOCKS] Using event-driven scanning on each sub-block...');
+        let scanning = false;
 
-        try {
-            const opportunities = await scanAllPaths(paths, tokenDatabase);
+        onFlashblock(async (flashblock) => {
+            if (!isRunning || scanning) return;
+            scanning = true;
 
-            if (opportunities && opportunities.length > 0) {
-                opportunities.sort((a, b) => {
-                    const profitA = BigInt(a.netProfit?.toString() || '0');
-                    const profitB = BigInt(b.netProfit?.toString() || '0');
-                    return profitB > profitA ? 1 : profitB < profitA ? -1 : 0;
-                });
-
-                log(`Found ${opportunities.length} profitable opportunities. Best: ${opportunities[0].pathDescription}`);
-                const result = await handleOpportunity(opportunities[0]);
-                if (result?.success) {
-                    log(`Trade successful! TX: ${result.txHash}`);
+            scanCount++;
+            try {
+                if (scanCount % 50 === 0) { // Log every 50th scan (every 10s)
+                    log(`--- Flashblock Scan #${scanCount} ---`);
                 }
-            } else {
-                log('No profitable opportunities found this scan.');
-            }
-        } catch (error) {
-            log(`Scan error: ${error.message}`);
-        }
 
-        await sleep(SCAN_INTERVAL);
+                const opportunities = await scanAllPaths(paths, tokenDatabase);
+                if (opportunities && opportunities.length > 0) {
+                    opportunities.sort((a, b) => {
+                        const profitA = BigInt(a.netProfit?.toString() || '0');
+                        const profitB = BigInt(b.netProfit?.toString() || '0');
+                        return profitB > profitA ? 1 : profitB < profitA ? -1 : 0;
+                    });
+
+                    log(`FOUND ${opportunities.length} profitable opportunities!`);
+                    const result = await handleOpportunity(opportunities[0]);
+                    if (result?.success) {
+                        log(`Trade successful! TX: ${result.txHash}`);
+                    }
+                }
+            } catch (error) {
+                log(`Flashblock scan error: ${error.message}`);
+            }
+            scanning = false;
+        });
+
+        // Keep the process alive
+        while (isRunning) {
+            await sleep(1000);
+        }
+    } else {
+        // Standard polling-based scanning
+        while (isRunning) {
+            scanCount++;
+            log(`--- Scan #${scanCount} ---`);
+
+            try {
+                const opportunities = await scanAllPaths(paths, tokenDatabase);
+
+                if (opportunities && opportunities.length > 0) {
+                    opportunities.sort((a, b) => {
+                        const profitA = BigInt(a.netProfit?.toString() || '0');
+                        const profitB = BigInt(b.netProfit?.toString() || '0');
+                        return profitB > profitA ? 1 : profitB < profitA ? -1 : 0;
+                    });
+
+                    log(`Found ${opportunities.length} profitable opportunities. Best: ${opportunities[0].pathDescription}`);
+                    const result = await handleOpportunity(opportunities[0]);
+                    if (result?.success) {
+                        log(`Trade successful! TX: ${result.txHash}`);
+                    }
+                } else {
+                    log('No profitable opportunities found this scan.');
+                }
+            } catch (error) {
+                log(`Scan error: ${error.message}`);
+            }
+
+            await sleep(scanInterval);
+        }
     }
 }
 
 /**
- * The main entry point for the bot.
+ * Main entry point.
  */
 async function main() {
     log('==========================================');
@@ -164,9 +198,9 @@ async function main() {
     log('  Contract: Typed Multi-DEX SwapSteps');
     log('==========================================');
 
+    // Wallet check
     if (!config.auth.privateKey || config.auth.privateKey === 'YOUR_WALLET_PRIVATE_KEY_HERE') {
         log('WARNING: No private key configured. Running in SCAN-ONLY mode.');
-        log('Set PRIVATE_KEY in .env to enable trade execution.');
     } else {
         log(`Wallet: ${wallet.address}`);
         try {
@@ -177,11 +211,22 @@ async function main() {
         }
     }
 
-    // Fetch flash loanable assets from Aave V3
+    // Initialize Flashblocks (optional, uses FLASHBLOCKS_WS_URL from .env)
+    log('Initializing Flashblocks...');
+    const fbEnabled = await initFlashblocks();
+    if (fbEnabled) {
+        log('Flashblocks ACTIVE - 200ms preconfirmations enabled');
+        log('Bot will scan on every sub-block for maximum speed');
+    } else {
+        log('Flashblocks not configured - using standard 2-second block times');
+        log('Tip: Set FLASHBLOCKS_WS_URL in .env for 10x faster execution');
+    }
+
+    // Fetch flash loanable assets
     log('Fetching Aave V3 flash loanable assets...');
     config.hubAssets = await getFlashLoanableAssets();
     if (!config.hubAssets || config.hubAssets.length === 0) {
-        log('WARNING: No flash loanable assets found. Using common tokens as fallback.');
+        log('WARNING: Using common tokens as fallback.');
         config.hubAssets = Object.values(config.commonTokens || {});
     }
     log(`Hub assets: ${config.hubAssets.length}`);
@@ -232,7 +277,7 @@ async function main() {
     log(`Loaded ${paths.length} arbitrage paths.`);
 
     if (!config.contractAddress[config.network]) {
-        log('WARNING: Contract not deployed. Deploy with: npx hardhat run scripts/deploy.js --network base');
+        log('WARNING: Contract not deployed. Run: npx hardhat run scripts/deploy.js --network base');
     }
 
     // Graceful shutdown
