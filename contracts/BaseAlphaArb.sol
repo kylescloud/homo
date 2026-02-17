@@ -317,7 +317,7 @@ contract BaseAlphaArb is FlashLoanSimpleReceiverBase, Ownable, Pausable, Reentra
     }
 
     /**
-     * @dev Generic swap via raw calldata (for aggregators like Odos)
+     * @dev Generic swap via raw calldata (for Odos aggregator, SushiSwap RouteProcessor4)
      */
     function _swapGeneric(SwapStep memory step) internal {
         require(step.data.length > 0, "No calldata for generic swap");
@@ -331,6 +331,24 @@ contract BaseAlphaArb is FlashLoanSimpleReceiverBase, Ownable, Pausable, Reentra
             }
             revert("Generic swap failed");
         }
+    }
+
+    /**
+     * @dev Uniswap V2 / BaseSwap typed swap via standard V2 router interface.
+     * Uses address[] path for token routing (standard AMM path).
+     */
+    function _swapUniswapV2(SwapStep memory step, uint256 amountIn) internal {
+        address[] memory path = new address[](2);
+        path[0] = step.tokenIn;
+        path[1] = step.tokenOut;
+
+        IUniswapV2Router02(step.router).swapExactTokensForTokens(
+            amountIn,
+            step.amountOutMin,
+            path,
+            address(this),
+            block.timestamp + 300 // 5 minute deadline
+        );
     }
 
     // ============================================================
